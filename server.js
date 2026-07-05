@@ -12,6 +12,7 @@ const rooms = new Map();          // roomCode -> { json: string, updatedAt: numb
 const users = new Map();          // friendId -> { nickname, avatar, lastSeenMs, nowPlaying, lastPlayed }
 const friendRequests = new Map(); // toId -> Set<fromId>
 const friendships = new Map();    // id -> Set<friendId>
+const roomInvites = new Map();    // toId -> [{ fromId, roomCode, ts }]
 
 const ONLINE_TIMEOUT_MS = 40 * 1000;
 const PORT = process.env.PORT || 3000;
@@ -121,7 +122,7 @@ const server = http.createServer((req, res) => {
     }
 
     if (req.method === 'POST') {
-      return readJsonBody(req, 50000, (err, body) => {
+      return readJsonBody(req, 120000, (err, body) => {
         if (err) return send(res, 400, JSON.stringify({ error: 'invalid json' }));
         const u = ensureUser(id);
         if (typeof body.nickname === 'string') u.nickname = body.nickname;
@@ -189,14 +190,54 @@ const server = http.createServer((req, res) => {
     return send(res, 200, JSON.stringify(list));
   }
 
+  // ---- room invites (right-click a friend > invite to room) ----
+  if (parts[0] === 'room-invite' && parts[1] && parts[2] && parts[3] && req.method === 'POST') {
+    const fromId = parts[1], toId = parts[2], roomCode = parts[3];
+    ensureUser(fromId); ensureUser(toId);
+    if (!roomInvites.has(toId)) roomInvites.set(toId, []);
+    const list = roomInvites.get(toId).filter(inv => inv.fromId !== fromId);
+    list.push({ fromId, roomCode, ts: Date.now() });
+    roomInvites.set(toId, list);
+    return send(res, 200, JSON.stringify({ ok: true }));
+  }
+
+  if (parts[0] === 'room-invites' && parts[1] && req.method === 'GET') {
+    const id = parts[1];
+    const cutoff = Date.now() - 5 * 60 * 1000; // invites expire after 5 minutes
+    const fresh = (roomInvites.get(id) || []).filter(inv => inv.ts > cutoff);
+    roomInvites.set(id, fresh);
+    const result = fresh.map(inv => {
+      const u = users.get(inv.fromId);
+      return {
+        fromId: inv.fromId,
+        fromNickname: u ? u.nickname : inv.fromId,
+        fromAvatar: u ? u.avatar : null,
+        roomCode: inv.roomCode
+      };
+    });
+    return send(res, 200, JSON.stringify(result));
+  }
+
+  if (parts[0] === 'room-invite-dismiss' && parts[1] && parts[2] && req.method === 'POST') {
+    const id = parts[1], fromId = parts[2];
+    if (roomInvites.has(id)) {
+      roomInvites.set(id, roomInvites.get(id).filter(inv => inv.fromId !== fromId));
+    }
+    return send(res, 200, JSON.stringify({ ok: true }));
+  }
+
   send(res, 404, JSON.stringify({ error: 'not found' }));
 });
 
-// Housekeeping: drop rooms nobody has touched in hours so memory doesn't grow forever.
+// Housekeeping: drop rooms nobody has touched in hours, and stale invites, so memory doesn't grow forever.
 setInterval(() => {
   const cutoff = Date.now() - 6 * 60 * 60 * 1000; // 6 saat
   for (const [code, entry] of rooms) {
     if (entry.updatedAt < cutoff) rooms.delete(code);
+  }
+  const inviteCutoff = Date.now() - 5 * 60 * 1000;
+  for (const [id, list] of roomInvites) {
+    roomInvites.set(id, list.filter(inv => inv.ts > inviteCutoff));
   }
 }, 30 * 60 * 1000);
 
