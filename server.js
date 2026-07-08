@@ -10,6 +10,7 @@ const path = require('path');
 
 const rooms = new Map();          // roomCode -> { json: string, updatedAt: number }
 const users = new Map();          // friendId -> { nickname, avatar, lastSeenMs, nowPlaying, lastPlayed }
+const roomChats = new Map();      // roomCode -> { messages: [{id,nickname,text,ts}], nextId, reads: {nick:id}, typing: {nick:ts} }
 const friendRequests = new Map(); // toId -> Set<fromId>
 const friendships = new Map();    // id -> Set<friendId>
 const roomInvites = new Map();    // toId -> [{ fromId, roomCode, ts }]
@@ -56,6 +57,13 @@ function tryServeStatic(req, res, pathname) {
   res.writeHead(200, { 'Content-Type': contentType, 'Access-Control-Allow-Origin': '*' });
   fs.createReadStream(filePath).pipe(res);
   return true;
+}
+
+function ensureChat(roomCode) {
+  if (!roomChats.has(roomCode)) {
+    roomChats.set(roomCode, { messages: [], nextId: 1, reads: {}, typing: {} });
+  }
+  return roomChats.get(roomCode);
 }
 
 function ensureUser(id) {
@@ -226,14 +234,58 @@ const server = http.createServer((req, res) => {
     return send(res, 200, JSON.stringify({ ok: true }));
   }
 
+  // ---- oda sohbeti ----
+  if (parts[0] === 'chat' && parts[1] && req.method === 'POST') {
+    const roomCode = parts[1];
+    return readJsonBody(req, 20000, (err, body) => {
+      if (err) return send(res, 400, JSON.stringify({ error: 'invalid json' }));
+      const chat = ensureChat(roomCode);
+      const nickname = String(body.nickname || '?').slice(0, 32);
+      const text = String(body.text || '').slice(0, 500);
+      if (!text.trim()) return send(res, 400, JSON.stringify({ error: 'empty message' }));
+      const msg = { id: chat.nextId++, nickname, text, ts: Date.now() };
+      chat.messages.push(msg);
+      if (chat.messages.length > 200) chat.messages.shift(); // bellek şişmesin diye eski mesajları at
+      return send(res, 200, JSON.stringify({ ok: true, id: msg.id }));
+    });
+  }
+
+  if (parts[0] === 'chat' && parts[1] && req.method === 'GET') {
+    const chat = ensureChat(parts[1]);
+    const now = Date.now();
+    const typingNicknames = Object.entries(chat.typing)
+      .filter(([, ts]) => now - ts < 4000) // 4 saniyeden eski "yazıyor" sinyalleri geçersiz
+      .map(([nick]) => nick);
+    return send(res, 200, JSON.stringify({
+      messages: chat.messages,
+      reads: chat.reads,
+      typing: typingNicknames
+    }));
+  }
+
+  if (parts[0] === 'chat-typing' && parts[1] && parts[2] && req.method === 'POST') {
+    const chat = ensureChat(parts[1]);
+    chat.typing[decodeURIComponent(parts[2])] = Date.now();
+    return send(res, 200, JSON.stringify({ ok: true }));
+  }
+
+  if (parts[0] === 'chat-read' && parts[1] && parts[2] && parts[3] && req.method === 'POST') {
+    const chat = ensureChat(parts[1]);
+    chat.reads[decodeURIComponent(parts[2])] = parseInt(parts[3], 10);
+    return send(res, 200, JSON.stringify({ ok: true }));
+  }
+
   send(res, 404, JSON.stringify({ error: 'not found' }));
 });
 
-// Housekeeping: drop rooms nobody has touched in hours, and stale invites, so memory doesn't grow forever.
+// Housekeeping: drop rooms nobody has touched in hours, stale invites/chats, so memory doesn't grow forever.
 setInterval(() => {
   const cutoff = Date.now() - 6 * 60 * 60 * 1000; // 6 saat
   for (const [code, entry] of rooms) {
-    if (entry.updatedAt < cutoff) rooms.delete(code);
+    if (entry.updatedAt < cutoff) {
+      rooms.delete(code);
+      roomChats.delete(code);
+    }
   }
   const inviteCutoff = Date.now() - 5 * 60 * 1000;
   for (const [id, list] of roomInvites) {
